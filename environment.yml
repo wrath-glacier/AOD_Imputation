@@ -1,0 +1,16 @@
+name: adp
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - earthengine-api=1.7.49
+  - earthaccess
+  - xarray
+  - matplotlib
+  - numpy
+  - rasterio
+  - pyproj
+  - shapely
+  - tqdm
+  - zarr=2.18.7
+  - numcodecs=0.15.1

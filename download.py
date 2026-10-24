@@ -2,19 +2,18 @@
 """Fast, resumable downloader for MAIAC AOD, ERA5-Land & MERRA-2 over India.
 
 Downloads analysis-ready daily products for mainland India and stores them in
-Zarr v2 directory stores. Designed for incremental scaling: test with one year,
-then expand to the full 2000-2025 range.
+Zarr v2 directory stores. Run the one-day pilot first, then explicitly choose
+the date range for any larger download.
 
 Usage:
-    python download.py --years 2023                 # Single year test
-    python download.py --years 2019-2023            # 5-year range
-    python download.py --years 2000-2025            # Full 26-year dataset
+    python download.py --years 2023                 # Explicit full-year run
+    python download.py --years 2019-2023            # Explicit 5-year run
     python download.py --years 2023 --datasets aod  # AOD only
     python download.py --pilot                      # One day (2023-01-15)
 
 Requirements:
     conda activate adp
-    Earth Engine authenticated for project 'additional-project-511308'
+    Earth Engine authenticated for project 'additional-project-511307'
 """
 from __future__ import annotations
 
@@ -22,11 +21,13 @@ import argparse
 import calendar
 import concurrent.futures as cf
 import datetime as dt
+import fcntl
 import json
 import math
 import os
 import random
 import shutil
+import tempfile
 import threading
 import time
 import urllib.request
@@ -49,8 +50,9 @@ from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data' / 'processed'
-TEMP = ROOT / 'data' / 'raw' / 'transfer'
-EE_PROJECT = 'additional-project-511308'
+TEMP_ROOT = ROOT / 'data' / 'raw' / 'transfer'
+TEMP = None
+EE_PROJECT = 'additional-project-511307'
 EE_ENDPOINT = 'https://earthengine-highvolume.googleapis.com'
 
 # Earth Engine collection IDs
@@ -73,20 +75,40 @@ ERA5_BANDS = [
     'surface_pressure', 'total_precipitation_sum',
 ]
 
-# Native-grid affine transforms (used as crs_transform for Earth Engine)
+# Native-grid affine transforms (pixel-edge convention, x/y scale first)
 ERA5_NATIVE_TF = [0.1, 0.0, -180.05, 0.0, -0.1, 90.05]
-MERRA_NATIVE_TF = [0.625, 0.0, -180.5, 0.0, 0.5, -90.5]
+MERRA_NATIVE_TF = [0.625, 0.0, -180.3125, 0.0, 0.5, -90.25]
 
 # Expected output transforms for validation (Earth Engine clips to the bbox)
 ERA5_OUT_TF = [66.95, 0.1, 0.0, 39.05, 0.0, -0.1]
-MERRA_OUT_TF = [67.0, 0.625, 0.0, 5.0, 0.0, 0.5]
 
 # India bounding box for ERA5/MERRA-2 (lon_min, lat_min, lon_max, lat_max)
 INDIA_BBOX = (67.0, 5.0, 99.0, 39.0)
 
+
+def _positive_grid_crop(native_tf, bbox):
+    """Outward-snap a bbox to a positive-x/positive-y native cell-edge grid."""
+    xscale, _, xorigin, _, yscale, yorigin = native_tf
+    xmin, ymin, xmax, ymax = bbox
+    x0 = xorigin + math.floor((xmin - xorigin) / xscale) * xscale
+    x1 = xorigin + math.ceil((xmax - xorigin) / xscale) * xscale
+    y0 = yorigin + math.floor((ymin - yorigin) / yscale) * yscale
+    y1 = yorigin + math.ceil((ymax - yorigin) / yscale) * yscale
+    cols = int(round((x1 - x0) / xscale))
+    rows = int(round((y1 - y0) / yscale))
+    return [x0, xscale, 0.0, y0, 0.0, yscale], rows, cols
+
+
+MERRA_OUT_TF, MERRA_ROWS, MERRA_COLS = _positive_grid_crop(
+    MERRA_NATIVE_TF, INDIA_BBOX)
+
 # Zarr storage settings
 CHUNK = 1024
 COMPRESSOR = Blosc(cname='zstd', clevel=5, shuffle=Blosc.BITSHUFFLE)
+AOD_RULE = ('MCD19A2.061 Optical_Depth_055 raw 0..3000; '
+            'AOD_QA cloud=1, land=0, adjacency=0, quality=0; '
+            'mean across granules, round to integer; scale=0.001')
+MAIAC_START = dt.date(2000, 2, 24)
 
 
 # ── Boundary & Grid ────────────────────────────────────────────────────────────
@@ -135,6 +157,91 @@ def compute_grid(buffer_sinu):
     return width, height, (RES, 0.0, x0, 0.0, -RES, y0)
 
 
+def ee_transform_to_gdal(tf6):
+    """Convert Earth Engine affine order to GDAL geotransform order."""
+    return (tf6[2], tf6[0], tf6[1], tf6[5], tf6[3], tf6[4])
+
+
+def _write_mask(group, name, values):
+    """Store zero/one mask values with an unused xarray fill code."""
+    values = np.asarray(values, dtype='uint8')
+    if name in group and group[name].shape == values.shape:
+        mask = group[name]
+        if mask.fill_value == 255:
+            mask[:] = values
+            mask.attrs['_ARRAY_DIMENSIONS'] = ['y', 'x']
+            return
+        del group[name]
+    elif name in group:
+        del group[name]
+    mask = group.create_dataset(name, data=values, chunks=(CHUNK, CHUNK),
+                                dtype='uint8', fill_value=255,
+                                compressor=COMPRESSOR)
+    mask.attrs['_ARRAY_DIMENSIONS'] = ['y', 'x']
+
+
+def _ensure_zero_is_data(group, name, dimensions):
+    """Use an unused fill code and materialize zero-valued completion flags."""
+    if name not in group:
+        return
+    old = group[name]
+    old_dims = list(dimensions)
+    if old.fill_value == 255:
+        old.attrs['_ARRAY_DIMENSIONS'] = old_dims
+        values = np.asarray(old[:])
+        missing = values == 255
+        if missing.any():
+            values[missing] = 0
+            old[:] = values
+        return
+    values = (np.asarray(old[:]) if old.fill_value is not None
+              else np.zeros(old.shape, dtype=old.dtype))
+    shape, chunks, dtype = old.shape, old.chunks, old.dtype
+    del group[name]
+    new = group.create_dataset(name, shape=shape, chunks=chunks, dtype=dtype,
+                               fill_value=255, compressor=COMPRESSOR)
+    new.attrs['_ARRAY_DIMENSIONS'] = old_dims
+    new[:] = 0
+    for index in np.argwhere(values != 0):
+        key = tuple(int(i) for i in index)
+        new[key] = values[key]
+
+
+def _ensure_count_fill(group):
+    """Use uint16 sentinel 65535; copy only committed AOD tiles in bounded chunks."""
+    if 'accepted_count' not in group:
+        return
+    old = group['accepted_count']
+    old.attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
+    if old.dtype == np.dtype('uint16') and old.fill_value == 65535:
+        return
+    if 'complete' not in group:
+        raise ValueError('Cannot migrate accepted_count without AOD completion flags')
+    temp_name = 'accepted_count_fill_none_tmp'
+    if temp_name in group:
+        del group[temp_name]
+    shape, chunks, dtype = old.shape, old.chunks, old.dtype
+    trustworthy_counts = old.fill_value == 0
+    if not trustworthy_counts:
+        # A null Zarr fill value has undefined implicit chunk contents in v2.
+        # Force refetch of all counts rather than trusting possibly repeated data.
+        group['complete'][:] = 0
+    new = group.create_dataset(temp_name, shape=shape, chunks=chunks, dtype='uint16',
+                               fill_value=65535, compressor=COMPRESSOR)
+    new.attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
+    complete = group['complete']
+    if trustworthy_counts:
+        for day, row, col in np.argwhere(np.asarray(complete[:]) > 0):
+            y0, x0 = int(row) * CHUNK, int(col) * CHUNK
+            height = min(CHUNK, shape[1] - y0)
+            width = min(CHUNK, shape[2] - x0)
+            new[int(day), y0:y0 + height, x0:x0 + width] = \
+                old[int(day), y0:y0 + height, x0:x0 + width]
+    del group['accepted_count']
+    group.move(temp_name, 'accepted_count')
+    group['accepted_count'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
+
+
 def raster_mask(geometry, height, width, tf6):
     """Rasterise a Shapely geometry into a uint8 mask."""
     aff = Affine.from_gdal(tf6[2], tf6[0], tf6[1], tf6[5], tf6[3], tf6[4])
@@ -153,14 +260,12 @@ def init_static(mainland_sinu, buffer_sinu, boundary_info, width, height, tf6):
 
     static = zarr.open_group(str(DATA / 'static.zarr'), mode='a')
     for name, arr in [('target_mask', target), ('context_mask', context)]:
-        if name not in static:
-            static.create_dataset(name, data=arr, chunks=(CHUNK, CHUNK),
-                                  compressor=COMPRESSOR)
-        static[name].attrs['_ARRAY_DIMENSIONS'] = ['y', 'x']
+        _write_mask(static, name, arr)
 
     static.attrs.update({
         'crs': GEE_SINU, 'resolution_m': RES,
-        'transform_gdal': list(tf6),
+        'ee_crs_transform': list(tf6),
+        'transform_gdal': list(ee_transform_to_gdal(tf6)),
     })
 
     geo_path = DATA / 'mainland_india.geojson'
@@ -184,21 +289,35 @@ def init_year(year, width, height, tf6):
         ag.create_dataset('aod', shape=(days, height, width),
                           chunks=(1, CHUNK, CHUNK), dtype='int16',
                           fill_value=-32768, compressor=COMPRESSOR)
-        ag['aod'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
+    if ag['aod'].shape != (days, height, width):
+        raise ValueError(f'AOD shape mismatch in {year}: {ag["aod"].shape}')
+    ag['aod'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
     if 'accepted_count' not in ag:
         ag.create_dataset('accepted_count', shape=(days, height, width),
-                          chunks=(1, CHUNK, CHUNK), dtype='uint8',
-                          fill_value=0, compressor=COMPRESSOR)
-        ag['accepted_count'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
+                          chunks=(1, CHUNK, CHUNK), dtype='uint16',
+                          fill_value=65535, compressor=COMPRESSOR)
+    if ag['accepted_count'].shape != (days, height, width):
+        raise ValueError(f'AOD count shape mismatch in {year}: {ag["accepted_count"].shape}')
+    ag['accepted_count'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
     if 'complete' not in ag:
         ncy = math.ceil(height / CHUNK)
         ncx = math.ceil(width / CHUNK)
         ag.create_dataset('complete', shape=(days, ncy, ncx), chunks=(1, 1, 1),
-                          dtype='uint8', fill_value=0, compressor=COMPRESSOR)
+                          dtype='uint8', fill_value=255, compressor=COMPRESSOR)
+    if ag['complete'].shape != (days, math.ceil(height / CHUNK), math.ceil(width / CHUNK)):
+        raise ValueError(f'AOD completion shape mismatch in {year}: {ag["complete"].shape}')
+    _ensure_zero_is_data(ag, 'complete', ['time', 'chunk_y', 'chunk_x'])
+    _ensure_count_fill(ag)
     _write_sinu_coords(ag, year, days, width, height, tf6)
+    old_rule = ag.attrs.get('aod_rule')
+    if old_rule is not None and old_rule != AOD_RULE:
+        raise ValueError('AOD rule changed; refusing to resume this Zarr group')
     ag.attrs.update({'crs': GEE_SINU, 'resolution_m': RES,
-                     'transform_gdal': list(tf6),
-                     'aod_scale': 0.001, 'aod_fill': -32768})
+                     'ee_crs_transform': list(tf6),
+                     'transform_gdal': list(ee_transform_to_gdal(tf6)),
+                     'aod_scale': 0.001, 'aod_fill': -32768,
+                     'aod_rule': AOD_RULE,
+                     'collection_start': MAIAC_START.isoformat()})
     stores[('aod', year)] = ag
 
     # ── ERA5 ──
@@ -208,27 +327,65 @@ def init_year(year, width, height, tf6):
                           chunks=(1, 6, 128, 128), dtype='float32',
                           fill_value=-9999, compressor=COMPRESSOR)
         eg['era5'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'band', 'y', 'x']
+    if eg['era5'].shape != (days, 6, 341, 321):
+        raise ValueError(f'ERA5 shape mismatch in {year}: {eg["era5"].shape}')
+    eg['era5'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'band', 'y', 'x']
     if 'complete' not in eg:
         eg.create_dataset('complete', shape=(days,), chunks=(1,),
-                          dtype='uint8', fill_value=0, compressor=COMPRESSOR)
+                          dtype='uint8', fill_value=255, compressor=COMPRESSOR)
+    _ensure_zero_is_data(eg, 'complete', ['time'])
     _write_ll_coords(eg, year, days, ERA5_OUT_TF, 321, 341, ERA5_BANDS)
     eg.attrs.update({'crs': 'EPSG:4326', 'bands': ERA5_BANDS,
+                     'transform_gdal': ERA5_OUT_TF,
                      'native_transform_gdal': ERA5_OUT_TF})
     stores[('era5', year)] = eg
 
     # ── MERRA-2 ──
     mg = zarr.open_group(str(DATA / 'merra2.zarr'), mode='a').require_group(str(year))
+    expected_merra_shape = (days, MERRA_ROWS, MERRA_COLS)
+    if 'totexttau' in mg and mg['totexttau'].shape != expected_merra_shape:
+        old_shape = mg['totexttau'].shape
+        grid_tag = f'{old_shape[-2]}x{old_shape[-1]}'
+        legacy_name = f'totexttau_legacy_{grid_tag}'
+        if legacy_name in mg:
+            raise ValueError(f'Cannot preserve old MERRA array; {legacy_name} already exists')
+        mg.move('totexttau', legacy_name)
+        legacy_y, legacy_x = f'legacy_y_{grid_tag}', f'legacy_x_{grid_tag}'
+        mg[legacy_name].attrs['_ARRAY_DIMENSIONS'] = ['time', legacy_y, legacy_x]
+        mg[legacy_name].attrs['grid_status'] = 'superseded: incorrect native-grid offset'
+        mg.attrs[f'legacy_transform_gdal_{grid_tag}'] = mg.attrs.get('transform_gdal', mg.attrs.get('native_transform_gdal', []))
+        for coord, legacy_coord, dim in [('x', legacy_x, legacy_x),
+                                         ('y', legacy_y, legacy_y)]:
+            if coord in mg:
+                if legacy_coord in mg:
+                    raise ValueError(f'Cannot preserve old MERRA coordinate; {legacy_coord} already exists')
+                mg.move(coord, legacy_coord)
+                mg[legacy_coord].attrs['_ARRAY_DIMENSIONS'] = [dim]
+        if 'complete' in mg:
+            old_complete = f'complete_legacy_{grid_tag}'
+            if old_complete in mg:
+                raise ValueError(f'Cannot preserve old completion flags; {old_complete} already exists')
+            mg.move('complete', old_complete)
+            _ensure_zero_is_data(mg, old_complete, ['time'])
+        print(f'Preserved superseded MERRA-2 array {year} {old_shape}; rebuilding on verified cell centres.', flush=True)
     if 'totexttau' not in mg:
-        mg.create_dataset('totexttau', shape=(days, 68, 52),
-                          chunks=(1, 68, 52), dtype='float32',
+        mg.create_dataset('totexttau', shape=expected_merra_shape,
+                          chunks=(1, MERRA_ROWS, MERRA_COLS), dtype='float32',
                           fill_value=-9999, compressor=COMPRESSOR)
-        mg['totexttau'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
+    if mg['totexttau'].shape != expected_merra_shape:
+        raise ValueError(f'MERRA-2 shape mismatch in {year}: {mg["totexttau"].shape}')
+    mg['totexttau'].attrs['_ARRAY_DIMENSIONS'] = ['time', 'y', 'x']
     if 'complete' not in mg:
         mg.create_dataset('complete', shape=(days,), chunks=(1,),
-                          dtype='uint8', fill_value=0, compressor=COMPRESSOR)
-    _write_ll_coords(mg, year, days, MERRA_OUT_TF, 52, 68)
+                          dtype='uint8', fill_value=255, compressor=COMPRESSOR)
+    _ensure_zero_is_data(mg, 'complete', ['time'])
+    for legacy_flag in [k for k in mg.array_keys() if k.startswith('complete_legacy')]:
+        _ensure_zero_is_data(mg, legacy_flag, ['time'])
+    _write_ll_coords(mg, year, days, MERRA_OUT_TF, MERRA_COLS, MERRA_ROWS)
     mg.attrs.update({'crs': 'EPSG:4326',
-                     'native_transform_gdal': MERRA_OUT_TF})
+                     'transform_gdal': MERRA_OUT_TF,
+                     'native_transform_gdal': MERRA_OUT_TF,
+                     'source_grid_cell_centres': 'lon -180..179.375 by 0.625; lat -90..90 by 0.5'})
     stores[('merra2', year)] = mg
 
     return stores
@@ -261,23 +418,24 @@ def _write_sinu_coords(g, year, days, width, height, tf6):
 
 def _write_ll_coords(g, year, days, out_tf, cols, rows, bands=None):
     """Write time/x/y (and optionally band) for lat-lon grids."""
-    if 'time' in g:
-        return
-    g.create_dataset('time', data=_epoch_days(year, days),
-                     chunks=(days,), compressor=COMPRESSOR)
-    g['time'].attrs.update({'units': 'days since 1970-01-01',
-                            'calendar': 'proleptic_gregorian',
-                            '_ARRAY_DIMENSIONS': ['time']})
-    if bands:
+    if 'time' not in g:
+        g.create_dataset('time', data=_epoch_days(year, days),
+                         chunks=(days,), compressor=COMPRESSOR)
+        g['time'].attrs.update({'units': 'days since 1970-01-01',
+                                'calendar': 'proleptic_gregorian',
+                                '_ARRAY_DIMENSIONS': ['time']})
+    if bands and 'band' not in g:
         g.create_dataset('band', data=np.array(bands, dtype='S32'),
                          chunks=(len(bands),), compressor=COMPRESSOR)
         g['band'].attrs['_ARRAY_DIMENSIONS'] = ['band']
-    g.create_dataset('x', data=out_tf[0] + (np.arange(cols) + 0.5) * out_tf[1],
-                     chunks=(cols,), compressor=COMPRESSOR)
-    g.create_dataset('y', data=out_tf[3] + (np.arange(rows) + 0.5) * out_tf[5],
-                     chunks=(rows,), compressor=COMPRESSOR)
-    g['x'].attrs['_ARRAY_DIMENSIONS'] = ['x']
-    g['y'].attrs['_ARRAY_DIMENSIONS'] = ['y']
+    if 'x' not in g:
+        g.create_dataset('x', data=out_tf[0] + (np.arange(cols) + 0.5) * out_tf[1],
+                         chunks=(cols,), compressor=COMPRESSOR)
+        g['x'].attrs['_ARRAY_DIMENSIONS'] = ['x']
+    if 'y' not in g:
+        g.create_dataset('y', data=out_tf[3] + (np.arange(rows) + 0.5) * out_tf[5],
+                         chunks=(rows,), compressor=COMPRESSOR)
+        g['y'].attrs['_ARRAY_DIMENSIONS'] = ['y']
 
 
 # ── Download Helpers ────────────────────────────────────────────────────────────
@@ -327,7 +485,23 @@ def aod_tiles(context):
     return tiles
 
 
-def download_aod_tile(day, grid, tile, context, stores):
+def align_aod_array(arr, target_h, target_w, row_offset, col_offset):
+    """Place a returned 2-band raster on the requested tile grid."""
+    if arr.ndim != 3 or arr.shape[0] != 2:
+        raise ValueError(f'Expected two-band tile array, got {arr.shape}')
+    aligned = np.empty((2, target_h, target_w), dtype=arr.dtype)
+    aligned[0].fill(-32768)
+    aligned[1].fill(0)
+    sy, sx = max(0, row_offset), max(0, col_offset)
+    dy, dx = max(0, -row_offset), max(0, -col_offset)
+    ch = min(target_h - dy, arr.shape[1] - sy)
+    cw = min(target_w - dx, arr.shape[2] - sx)
+    if ch > 0 and cw > 0:
+        aligned[:, dy:dy + ch, dx:dx + cw] = arr[:, sy:sy + ch, sx:sx + cw]
+    return aligned
+
+
+def download_aod_tile(day, grid, tile, context, stores, fetch_budget=None):
     """Download and write one AOD spatial chunk. Returns True if newly downloaded."""
     width, height, tf6 = grid
     r, c, x, y, ww, hh = tile
@@ -374,25 +548,23 @@ def download_aod_tile(day, grid, tile, context, stores):
 
     tif = TEMP / f'{day:%Y%m%d}_r{r:02d}c{c:02d}.tif'
     try:
+        if fetch_budget is not None:
+            fetch_budget.reserve()
         arr, gdal_tf = fetch_tif(packed, rect, tif, crs=GEE_SINU, transform=tile_tf)
 
         if arr.shape[0] != 2 or abs(arr.shape[1] - hh) > 1 or abs(arr.shape[2] - ww) > 1:
             raise ValueError(f'Tile {r},{c}: shape {arr.shape}, expected ~{(2, hh, ww)}')
 
-        # Align returned array to the exact target grid (handles ±1 pixel edge)
+        # Align only integral-pixel offsets; a fractional shift is a grid error.
         actual = np.asarray(gdal_tf, dtype='float64')
-        aligned = np.empty((2, hh, ww), dtype='float32')
-        aligned[0].fill(-32768)
-        aligned[1].fill(0)
-
-        co = int(round((x0 - actual[0]) / RES))
-        ro = int(round((actual[3] - y0) / RES))
-        sy, sx = max(0, ro), max(0, co)
-        dy, dx = max(0, -ro), max(0, -co)
-        ch = min(hh - dy, arr.shape[1] - sy)
-        cw = min(ww - dx, arr.shape[2] - sx)
-        if ch > 0 and cw > 0:
-            aligned[:, dy:dy + ch, dx:dx + cw] = arr[:, sy:sy + ch, sx:sx + cw]
+        col_offset = (x0 - actual[0]) / RES
+        row_offset = (actual[3] - y0) / RES
+        if not np.allclose([row_offset, col_offset],
+                           np.rint([row_offset, col_offset]), atol=1e-4):
+            raise ValueError(f'Tile {r},{c}: non-integral returned grid offset '
+                             f'row={row_offset}, col={col_offset}')
+        aligned = align_aod_array(arr, hh, ww,
+                                  int(round(row_offset)), int(round(col_offset)))
 
         ad = np.rint(aligned[0]).astype('int16')
         cnt = np.clip(np.rint(aligned[1]), 0, 255).astype('uint8')
@@ -412,7 +584,7 @@ def download_aod_tile(day, grid, tile, context, stores):
 
 # ── ERA5-Land & MERRA-2 ────────────────────────────────────────────────────────
 
-def download_era5(day, stores):
+def download_era5(day, stores, fetch_budget=None):
     """Download ERA5-Land for one day. Returns True if newly downloaded."""
     group = stores[('era5', day.year)]
     idx = doy(day)
@@ -421,12 +593,16 @@ def download_era5(day, stores):
 
     d0, d1 = day.isoformat(), (day + dt.timedelta(days=1)).isoformat()
     region = ee.Geometry.BBox(*INDIA_BBOX)
-
-    image = (ee.ImageCollection(ERA5).filterDate(d0, d1).first()
-             .select(ERA5_BANDS).toFloat().unmask(-9999, False))
+    collection = ee.ImageCollection(ERA5).filterDate(d0, d1)
+    if collection.size().getInfo() == 0:
+        raise RuntimeError(f'No ERA5-Land image for {day}')
+    image = (collection.first().select(ERA5_BANDS)
+             .toFloat().unmask(-9999, False))
 
     tif = TEMP / f'{day:%Y%m%d}_era5.tif'
     try:
+        if fetch_budget is not None:
+            fetch_budget.reserve()
         arr, gdal_tf = fetch_tif(image, region, tif,
                                  crs='EPSG:4326', transform=ERA5_NATIVE_TF)
         if arr.shape != (6, 341, 321):
@@ -441,7 +617,7 @@ def download_era5(day, stores):
         tif.unlink(missing_ok=True)
 
 
-def download_merra2(day, stores):
+def download_merra2(day, stores, fetch_budget=None):
     """Download MERRA-2 TOTEXTTAU for one day. Returns True if newly downloaded."""
     group = stores[('merra2', day.year)]
     idx = doy(day)
@@ -451,15 +627,21 @@ def download_merra2(day, stores):
     d0, d1 = day.isoformat(), (day + dt.timedelta(days=1)).isoformat()
     region = ee.Geometry.BBox(*INDIA_BBOX)
 
-    image = (ee.ImageCollection(MERRA).filterDate(d0, d1)
-             .select('TOTEXTTAU').mean().toFloat().unmask(-9999, False))
+    collection = ee.ImageCollection(MERRA).filterDate(d0, d1)
+    if collection.size().getInfo() == 0:
+        raise RuntimeError(f'No MERRA-2 image for {day}')
+    image = (collection.select('TOTEXTTAU').mean()
+             .toFloat().unmask(-9999, False))
 
     tif = TEMP / f'{day:%Y%m%d}_merra2.tif'
     try:
+        if fetch_budget is not None:
+            fetch_budget.reserve()
         arr, gdal_tf = fetch_tif(image, region, tif,
                                  crs='EPSG:4326', transform=MERRA_NATIVE_TF)
-        if arr.shape != (1, 68, 52):
-            raise ValueError(f'MERRA-2 shape {arr.shape}, expected (1, 68, 52)')
+        if arr.shape != (1, MERRA_ROWS, MERRA_COLS):
+            raise ValueError(f'MERRA-2 shape {arr.shape}, expected '
+                             f'(1, {MERRA_ROWS}, {MERRA_COLS})')
         if not np.allclose(gdal_tf, MERRA_OUT_TF, atol=1e-7):
             raise ValueError(f'MERRA-2 transform mismatch: {gdal_tf}')
 
@@ -472,27 +654,54 @@ def download_merra2(day, stores):
 
 # ── Day Processing ──────────────────────────────────────────────────────────────
 
+class FetchBudget:
+    """Thread-safe cap on TIFF fetch jobs attempted for one day."""
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = 0
+        self.lock = threading.Lock()
+
+    def reserve(self):
+        with self.lock:
+            if self.used >= self.limit:
+                raise FetchLimitExceeded(
+                    f'Daily TIFF fetch cap reached ({self.limit})')
+            self.used += 1
+
+
+class FetchLimitExceeded(RuntimeError):
+    """The per-day TIFF transfer budget was exhausted."""
+
+
 def process_day(day, boundary, grid, datasets, context, stores, tile_workers,
-                on_aod_tile=None):
+                on_aod_tile=None, max_fetches_per_day=32):
     """Download all selected datasets for one day, with retries."""
+    fetch_budget = FetchBudget(max_fetches_per_day)
     last_err = None
     for attempt in range(5):
         try:
-            return _do_day(day, grid, datasets, context, stores,
-                           tile_workers, on_aod_tile)
+            _do_day(day, grid, datasets, context, stores,
+                    tile_workers, on_aod_tile, fetch_budget)
+            return fetch_budget.used
         except Exception as e:
+            if isinstance(e, (FetchLimitExceeded, ValueError)):
+                e.tiff_fetch_attempts = fetch_budget.used
+                raise
             last_err = e
             if attempt < 4:
                 time.sleep(min(60, 2 ** attempt) + random.random())
+    last_err.tiff_fetch_attempts = fetch_budget.used
     raise last_err
 
 
-def _do_day(day, grid, datasets, context, stores, tile_workers, on_aod_tile):
+def _do_day(day, grid, datasets, context, stores, tile_workers, on_aod_tile,
+            fetch_budget=None):
     """Inner day download (no retries)."""
     if 'aod' in datasets:
         tiles = aod_tiles(context)
         with cf.ThreadPoolExecutor(max_workers=tile_workers) as pool:
-            futs = [pool.submit(download_aod_tile, day, grid, t, context, stores)
+            futs = [pool.submit(download_aod_tile, day, grid, t, context, stores,
+                                fetch_budget)
                     for t in tiles]
             for f in cf.as_completed(futs):
                 is_new = f.result()
@@ -500,10 +709,10 @@ def _do_day(day, grid, datasets, context, stores, tile_workers, on_aod_tile):
                     on_aod_tile(is_new)
 
     if 'era5' in datasets:
-        download_era5(day, stores)
+        download_era5(day, stores, fetch_budget)
 
     if 'merra2' in datasets:
-        download_merra2(day, stores)
+        download_merra2(day, stores, fetch_budget)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
@@ -539,7 +748,7 @@ def main():
         description='Download MAIAC AOD, ERA5-Land & MERRA-2 for mainland India',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap())
-    ap.add_argument('--years', nargs='+', default=['2023'],
+    ap.add_argument('--years', nargs='+',
                     help='Years: 2023, 2019-2023, or 2000-2025')
     ap.add_argument('--start-date', help='Override start date (YYYY-MM-DD)')
     ap.add_argument('--end-date', help='Override end date (YYYY-MM-DD)')
@@ -548,8 +757,10 @@ def main():
                     help='Which datasets to download (default: all)')
     ap.add_argument('--workers', type=int, default=4,
                     help='Parallel day-level workers (default: 4)')
-    ap.add_argument('--tile-workers', type=int, default=8,
-                    help='AOD tile workers per day (default: 8)')
+    ap.add_argument('--tile-workers', type=int, default=9,
+                    help='AOD tile workers per day (default: 9; 36 total with 4 day workers)')
+    ap.add_argument('--max-fetches-per-day', type=int, default=32,
+                    help='Maximum TIFF fetch attempts per day, including retries')
     ap.add_argument('--pilot', action='store_true',
                     help='Quick test: download 2023-01-15 only')
     ap.add_argument('--project', default=EE_PROJECT,
@@ -558,19 +769,34 @@ def main():
 
     # Handle pilot mode
     if args.pilot:
+        if args.years:
+            ap.error('--pilot cannot be combined with --years')
         years = [2023]
         args.start_date = args.end_date = '2023-01-15'
     else:
+        if not args.years:
+            ap.error('choose --pilot for the validated one-day run, or pass --years explicitly')
         years = parse_years(args.years)
 
     # Guard against exceeding Earth Engine's default 40 concurrent request quota
     if args.workers * args.tile_workers > 36:
         raise SystemExit('ERROR: workers × tile-workers must be ≤ 36 '
                          '(stay under EE 40-request quota)')
+    if args.max_fetches_per_day < 1:
+        raise SystemExit('ERROR: --max-fetches-per-day must be positive')
 
     # ── Initialise ──
-    TEMP.mkdir(parents=True, exist_ok=True)
     ee.Initialize(project=args.project, opt_url=EE_ENDPOINT)
+    DATA.mkdir(parents=True, exist_ok=True)
+    lock_file = (DATA / '.download.lock').open('a')
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_file.close()
+        raise SystemExit(f'Another downloader is using {DATA}') from exc
+    global TEMP
+    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    TEMP = Path(tempfile.mkdtemp(prefix=f'run-{os.getpid()}-', dir=TEMP_ROOT))
 
     print('Building India boundary and analysis grid...', flush=True)
     buffered, mainland_sinu, buffer_sinu, info = build_boundary()
@@ -583,6 +809,13 @@ def main():
     stores = {}
     for year in years:
         stores.update(init_year(year, width, height, tf6))
+
+    # Refresh consolidated metadata before work so an interrupted prior run
+    # cannot leave xarray readers pointed at stale group/array metadata.
+    for name in ['aod.zarr', 'era5.zarr', 'merra2.zarr', 'static.zarr']:
+        p = DATA / name
+        if p.exists():
+            zarr.consolidate_metadata(str(p))
 
     dates = build_dates(years, args.start_date, args.end_date)
     if not dates:
@@ -623,6 +856,7 @@ def main():
 
     # ── Download loop ──
     failed = []
+    fetches_by_day = {}
     with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
         pending = iter(dates)
         fut_map = {}
@@ -632,17 +866,20 @@ def main():
             d = next(pending)
             fut_map[pool.submit(process_day, d, buffered,
                                 (width, height, tf6), ds_set, context,
-                                stores, args.tile_workers, on_tile)] = d
+                                stores, args.tile_workers, on_tile,
+                                args.max_fetches_per_day)] = d
 
         while fut_map:
             done_futs, _ = cf.wait(fut_map, return_when=cf.FIRST_COMPLETED)
             for f in done_futs:
                 d = fut_map.pop(f)
                 try:
-                    f.result()
+                    fetches_by_day[d.isoformat()] = f.result()
                     day_bar.update(1)
                     day_bar.set_postfix(date=d.isoformat())
                 except Exception as e:
+                    fetches_by_day[d.isoformat()] = getattr(
+                        e, 'tiff_fetch_attempts', None)
                     failed.append((d.isoformat(), str(e)))
                     day_bar.update(1)
                     day_bar.set_postfix(date=d.isoformat(), status='FAIL')
@@ -654,7 +891,7 @@ def main():
                     fut_map[pool.submit(
                         process_day, nd, buffered, (width, height, tf6),
                         ds_set, context, stores, args.tile_workers,
-                        on_tile)] = nd
+                        on_tile, args.max_fetches_per_day)] = nd
                 except StopIteration:
                     pass
 
@@ -671,17 +908,25 @@ def main():
     manifest = {
         'years': years,
         'datasets': args.datasets,
+        'project': args.project,
+        'aod_rule': AOD_RULE if 'aod' in ds_set else None,
         'grid': {
             'crs': GEE_SINU, 'width': width, 'height': height,
-            'resolution_m': RES, 'transform': list(tf6),
+            'resolution_m': RES,
+            'ee_crs_transform': list(tf6),
+            'transform_gdal': list(ee_transform_to_gdal(tf6)),
         },
         'total_days': len(dates),
+        'max_fetches_per_day': args.max_fetches_per_day,
+        'tiff_fetch_attempts': fetches_by_day,
         'failed_days': len(failed),
         'completed_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     if failed:
         manifest['failed'] = failed
-    (DATA / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+    manifest_tmp = DATA / 'manifest.json.part'
+    manifest_tmp.write_text(json.dumps(manifest, indent=2))
+    os.replace(manifest_tmp, DATA / 'manifest.json')
 
     shutil.rmtree(TEMP, ignore_errors=True)
 
@@ -694,10 +939,8 @@ def main():
 
 def textwrap():
     return """Examples:
-  python download.py --years 2023              # Single year test
-  python download.py --years 2019-2023         # 5-year range
-  python download.py --years 2000-2025         # Full 26-year dataset
   python download.py --pilot                   # One day (2023-01-15)
+  python download.py --years 2023              # Explicit full-year run
   python download.py --years 2023 --datasets aod era5"""
 
 
