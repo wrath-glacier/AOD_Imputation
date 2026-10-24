@@ -1,0 +1,10 @@
+data/
+logs/
+*.pyc
+__pycache__/
+.env
+.netrc
+.cdsapirc
+*.egg-info/
+.ipynb_checkpoints/
+*.part
